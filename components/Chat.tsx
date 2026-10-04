@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { View, Text, TextInput, TouchableOpacity, FlatList, StyleSheet, SafeAreaView, KeyboardAvoidingView, Platform, ActivityIndicator, Alert, ScrollView, Modal } from 'react-native';
-import { Send, Menu, Film, Mic, Square, Bell, BellOff, X, Trash2, ChevronRight } from 'lucide-react-native';
+import { View, Text, TextInput, TouchableOpacity, FlatList, StyleSheet, SafeAreaView, KeyboardAvoidingView, Platform, ActivityIndicator, Alert, ScrollView, Modal, RefreshControl } from 'react-native';
+import { Send, Menu, Film, Mic, Square, Bell, BellOff, X, Trash2, ChevronRight, CheckCheck, Sparkles, Clock, MessageSquare } from 'lucide-react-native';
+import { Image } from 'expo-image';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import * as Notifications from 'expo-notifications';
 import * as SecureStore from 'expo-secure-store';
@@ -9,6 +10,35 @@ import * as FileSystem from 'expo-file-system/legacy';
 import { api } from '../api/client';
 import { normalizeMovie } from '../utils/normalization';
 import MovieCard from './Card';
+
+interface NotificationItem {
+  id: string;
+  title: string;
+  body: string;
+  date?: string;
+  timestamp?: string;
+  is_read: boolean;
+  data?: any;
+  movie?: any;
+}
+
+const formatNotificationDate = (dateStr?: string) => {
+  if (!dateStr) return '';
+  try {
+    const d = new Date(dateStr);
+    if (isNaN(d.getTime())) return dateStr;
+    const now = new Date();
+    const isToday = d.toDateString() === now.toDateString();
+    const time = d.toLocaleTimeString('tr-TR', { hour: '2-digit', minute: '2-digit' });
+    if (isToday) return `Bugün ${time}`;
+    const yesterday = new Date(now);
+    yesterday.setDate(now.getDate() - 1);
+    if (d.toDateString() === yesterday.toDateString()) return `Dün ${time}`;
+    return d.toLocaleDateString('tr-TR', { day: 'numeric', month: 'short' });
+  } catch {
+    return dateStr;
+  }
+};
 
 const Chat = ({ navigation, sessionId, messages, setMessages, fetchSessions, onShowRecommendations }: any) => {
   const insets = useSafeAreaInsets();
@@ -23,9 +53,14 @@ const Chat = ({ navigation, sessionId, messages, setMessages, fetchSessions, onS
   const audioRecorder = useAudioRecorder(audioOptions);
   const [isRecording, setIsRecording] = useState(false);
   const flatListRef = useRef<FlatList>(null);
-  const [notifications, setNotifications] = useState<any[]>([]);
+
+  const [notifications, setNotifications] = useState<NotificationItem[]>([]);
   const [showNotifications, setShowNotifications] = useState(false);
+  const [notificationsLoading, setNotificationsLoading] = useState(false);
+  const [refreshingNotifications, setRefreshingNotifications] = useState(false);
   const [suggestions, setSuggestions] = useState<string[]>(['Bilim kurgu filmi öner', 'Nolan filmi öner', 'Tim Burton filmi öner']);
+
+  const unreadCount = notifications.filter((n) => !n.is_read).length;
 
   // Bildirimleri yerel hafızadan (SecureStore) yükle
   useEffect(() => {
@@ -40,16 +75,83 @@ const Chat = ({ navigation, sessionId, messages, setMessages, fetchSessions, onS
       }
     };
     loadStoredNotifications();
+    fetchNotifications(true);
   }, []);
 
   // Bildirimleri kaydetme yardımcısı
-  const saveNotifications = async (updated: any[]) => {
+  const saveNotifications = async (updated: NotificationItem[]) => {
     setNotifications(updated);
     try {
       await SecureStore.setItemAsync('user_notifications', JSON.stringify(updated));
     } catch (e) {
       console.error("Bildirim kaydedilemedi:", e);
     }
+  };
+
+  // Backend'deki /recommendations uç noktasından bildirimleri çek ve yerel verilerle senkronize et
+  const fetchNotifications = async (showLoadingSpinner = false) => {
+    if (showLoadingSpinner) setNotificationsLoading(true);
+    try {
+      const res = await api.get('/recommendations');
+      const apiList = Array.isArray(res.data) ? res.data : [];
+
+      setNotifications((prev) => {
+        const prevMap = new Map<string, any>();
+        prev.forEach((n) => {
+          if (n.id) prevMap.set(String(n.id), n);
+          if (n.title) prevMap.set(String(n.title).toLowerCase().trim(), n);
+          if (n.movie?.Film) prevMap.set(String(n.movie.Film).toLowerCase().trim(), n);
+          if (n.movie?.title) prevMap.set(String(n.movie.title).toLowerCase().trim(), n);
+          if (n.data?.movie_title) prevMap.set(String(n.data.movie_title).toLowerCase().trim(), n);
+        });
+
+        const merged: NotificationItem[] = apiList.map((item: any) => {
+          const itemTitle = String(item.title || '').toLowerCase().trim();
+          const matchedPrev = prevMap.get(String(item.id)) || 
+                              prevMap.get(itemTitle) || 
+                              (item.movie_id ? prevMap.get(String(item.movie_id)) : null);
+          return {
+            id: String(item.id),
+            title: item.title,
+            body: item.body || item.message || '',
+            date: item.date,
+            is_read: Boolean(item.is_read),
+            data: item.data || matchedPrev?.data || (item.movie_id ? { movie_id: item.movie_id } : null),
+            movie: item.movie || matchedPrev?.movie || null,
+          };
+        });
+
+        // Backend'de henüz listelenmeyen anlık push bildirimlerini de koru
+        const apiIds = new Set(apiList.map((i: any) => String(i.id)));
+        const apiTitles = new Set(apiList.map((i: any) => String(i.title).toLowerCase().trim()));
+        const extraLocal = prev.filter(
+          (p) => !apiIds.has(String(p.id)) && !apiTitles.has(String(p.title).toLowerCase().trim())
+        );
+
+        const finalList = [...merged, ...extraLocal];
+        SecureStore.setItemAsync('user_notifications', JSON.stringify(finalList)).catch(() => {});
+        return finalList;
+      });
+    } catch (e) {
+      console.error("Bildirimler sunucudan çekilemedi:", e);
+    } finally {
+      if (showLoadingSpinner) setNotificationsLoading(false);
+      setRefreshingNotifications(false);
+    }
+  };
+
+  // Tüm bildirimleri okundu olarak işaretle (Backend + Local)
+  const handleMarkAllAsRead = async () => {
+    try {
+      await api.patch('/recommendations/read');
+    } catch (e) {
+      console.error("Okundu işaretleme hatası:", e);
+    }
+    setNotifications((prev) => {
+      const updated = prev.map((n) => ({ ...n, is_read: true }));
+      SecureStore.setItemAsync('user_notifications', JSON.stringify(updated)).catch(() => {});
+      return updated;
+    });
   };
 
   // Push bildirimi dinleyicileri ve token kaydı
@@ -84,54 +186,50 @@ const Chat = ({ navigation, sessionId, messages, setMessages, fetchSessions, onS
     };
     registerPushToken();
 
-    const addNotification = (notif: any) => {
-      const newNotif = {
+    const addNotificationFromPush = (notif: any) => {
+      const notifData: any = notif.request?.content?.data;
+      const notifTitle = notif.request?.content?.title;
+      const notifBody = notif.request?.content?.body || '';
+      
+      const newNotif: NotificationItem = {
         id: notif.request?.identifier || String(Date.now()),
-        title: notif.request?.content?.title || '🎬 Yeni Bildirim',
-        body: notif.request?.content?.body || '',
-        data: notif.request?.content?.data || null,
-        timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-        date: new Date().toLocaleDateString('tr-TR', { day: 'numeric', month: 'short' }),
+        title: notifData?.movies?.[0]?.Film || notifTitle || '🎬 Yeni Öneri',
+        body: notifBody,
+        data: notifData || null,
+        movie: notifData?.movies?.[0] || null,
+        date: new Date().toISOString(),
+        is_read: false,
       };
+
       setNotifications((prev) => {
         const updated = [newNotif, ...prev.filter((n) => n.id !== newNotif.id)];
         SecureStore.setItemAsync('user_notifications', JSON.stringify(updated)).catch(() => {});
         return updated;
       });
+      fetchNotifications();
     };
 
     const receivedSub = Notifications.addNotificationReceivedListener((notification) => {
-      addNotification(notification);
+      addNotificationFromPush(notification);
     });
 
     const responseSub = Notifications.addNotificationResponseReceivedListener((response) => {
-      const notifData = response.notification?.request?.content?.data;
-      addNotification(response.notification);
+      const notifData: any = response.notification?.request?.content?.data;
+      const notifTitle = response.notification?.request?.content?.title;
+      const notifBody = response.notification?.request?.content?.body || '';
 
-      let targetRawMovie = null;
-      if (Array.isArray(notifData?.movies) && notifData.movies.length > 0) {
-        if (notifData.movie_title) {
-          const targetTitle = String(notifData.movie_title).toLowerCase();
-          targetRawMovie = notifData.movies.find((m: any) => 
-            (m.Film || m.title || '').toLowerCase() === targetTitle
-          ) || notifData.movies[0];
-        } else {
-          targetRawMovie = notifData.movies[0];
-        }
-      } else if (notifData?.movie) {
-        targetRawMovie = notifData.movie;
-      } else if (notifData?.movie_title) {
-        targetRawMovie = {
-          ...notifData,
-          title: notifData.movie_title,
-          overview: response.notification?.request?.content?.body || notifData.overview,
-        };
-      }
+      const newNotif: NotificationItem = {
+        id: response.notification?.request?.identifier || String(Date.now()),
+        title: notifData?.movies?.[0]?.Film || notifTitle || '🎬 Yeni Öneri',
+        body: notifBody,
+        data: notifData || null,
+        movie: notifData?.movies?.[0] || null,
+        date: new Date().toISOString(),
+        is_read: true,
+      };
 
-      if (targetRawMovie) {
-        const movie = normalizeMovie(targetRawMovie);
-        navigation.navigate('MovieDetail', { movie, savedIds: favoriteIds, onToggle: fetchFavoriteIds });
-      }
+      handleNotificationPress(newNotif);
+      fetchNotifications();
     });
 
     return () => {
@@ -142,16 +240,28 @@ const Chat = ({ navigation, sessionId, messages, setMessages, fetchSessions, onS
   }, []);
 
   const handleClearNotifications = async () => {
+    try {
+      await api.patch('/recommendations/read').catch(() => {});
+    } catch (e) { }
     await saveNotifications([]);
   };
 
   const handleDeleteNotification = async (id: string) => {
-    const updated = notifications.filter((n) => n.id !== id);
+    const updated = notifications.filter((n) => String(n.id) !== String(id));
     await saveNotifications(updated);
   };
 
-  const handleNotificationPress = (notif: any) => {
+  const handleNotificationPress = (notif: NotificationItem) => {
     setShowNotifications(false);
+
+    // Bildirimi tekil olarak okundu yap
+    if (!notif.is_read) {
+      setNotifications((prev) => {
+        const updated = prev.map((n) => (String(n.id) === String(notif.id) ? { ...n, is_read: true } : n));
+        SecureStore.setItemAsync('user_notifications', JSON.stringify(updated)).catch(() => {});
+        return updated;
+      });
+    }
 
     let targetRawMovie = null;
     if (Array.isArray(notif.data?.movies) && notif.data.movies.length > 0) {
@@ -163,22 +273,64 @@ const Chat = ({ navigation, sessionId, messages, setMessages, fetchSessions, onS
       } else {
         targetRawMovie = notif.data.movies[0];
       }
+    } else if (notif.movie) {
+      targetRawMovie = notif.movie;
     } else if (notif.data?.movie) {
       targetRawMovie = notif.data.movie;
     } else if (notif.data?.movie_title) {
       targetRawMovie = {
         ...notif.data,
         title: notif.data.movie_title,
-        overview: notif.body || notif.data?.overview,
+        overview: notif.data?.overview || '',
+        recommendationNote: notif.body,
+        isPartial: true,
+      };
+    } else if (notif.title && notif.title !== '🎬 Yeni Bildirim' && notif.title !== 'Senin İçin Bir Film Buldum 🍿') {
+      targetRawMovie = {
+        id: notif.data?.movie_id || notif.title,
+        title: notif.title,
+        overview: '',
+        recommendationNote: notif.body,
+        isPartial: true,
       };
     }
 
     if (targetRawMovie) {
       const movie = normalizeMovie(targetRawMovie);
+      if (targetRawMovie.recommendationNote) {
+        movie.recommendationNote = targetRawMovie.recommendationNote;
+      }
       navigation.navigate('MovieDetail', { movie, savedIds: favoriteIds, onToggle: fetchFavoriteIds });
     } else if (notif.body) {
       handleSend(notif.body);
     }
+  };
+
+  // Bildirimdeki film hakkında yapay zekaya doğrudan soru sorma
+  const handleAskAboutMovie = (notif: NotificationItem) => {
+    setShowNotifications(false);
+    if (!notif.is_read) {
+      setNotifications((prev) => {
+        const updated = prev.map((n) => (String(n.id) === String(notif.id) ? { ...n, is_read: true } : n));
+        SecureStore.setItemAsync('user_notifications', JSON.stringify(updated)).catch(() => {});
+        return updated;
+      });
+    }
+
+    const movieTitle = notif.title && notif.title !== '🎬 Yeni Bildirim' && notif.title !== 'Senin İçin Bir Film Buldum 🍿'
+      ? notif.title
+      : notif.data?.movies?.[0]?.Film || notif.movie?.Film || '';
+
+    if (movieTitle) {
+      handleSend(`"${movieTitle}" filmi hakkında detaylı bilgi ver ve bana bu filmi neden önerdiğini açıkla.`);
+    } else if (notif.body) {
+      handleSend(notif.body);
+    }
+  };
+
+  const openNotificationModal = () => {
+    setShowNotifications(true);
+    fetchNotifications();
   };
 
   const fetchSuggestions = async () => {
@@ -198,6 +350,7 @@ const Chat = ({ navigation, sessionId, messages, setMessages, fetchSessions, onS
   useEffect(() => {
     fetchSuggestions();
     fetchFavoriteIds();
+    fetchNotifications();
   }, [sessionId]);
 
   useEffect(() => {
@@ -345,6 +498,10 @@ const Chat = ({ navigation, sessionId, messages, setMessages, fetchSessions, onS
       setMessages((prev: any) => [...prev, { role: 'assistant', content: finalContent + `\n\n⏱️ Yanıt Süresi: ${responseTime} saniye`, movies: extractedMovies }]);
       fetchSessions();
       fetchSuggestions();
+      // Arka planda generate_and_save_recommendation_task çalıştığı için kısa bir süre sonra bildirimleri senkronize et
+      setTimeout(() => {
+        fetchNotifications();
+      }, 3500);
     } catch (e: any) {
       if (controller.signal.aborted || e?.name === 'CanceledError' || e?.name === 'AbortError' || e?.code === 'ERR_CANCELED') {
         return;
@@ -394,12 +551,12 @@ const Chat = ({ navigation, sessionId, messages, setMessages, fetchSessions, onS
             <Film color="#E50914" size={20} />
             <Text style={styles.headerTitle}>Movie AI</Text>
           </View>
-          <TouchableOpacity onPress={() => setShowNotifications(true)} style={styles.headerIconButton} activeOpacity={0.7}>
+          <TouchableOpacity onPress={openNotificationModal} style={styles.headerIconButton} activeOpacity={0.7}>
             <Bell color="#fff" size={22} />
-            {notifications.length > 0 && (
+            {unreadCount > 0 && (
               <View style={styles.notificationBadge}>
                 <Text style={styles.notificationBadgeText}>
-                  {notifications.length > 9 ? '9+' : notifications.length}
+                  {unreadCount > 9 ? '9+' : unreadCount}
                 </Text>
               </View>
             )}
@@ -445,7 +602,7 @@ const Chat = ({ navigation, sessionId, messages, setMessages, fetchSessions, onS
         </View>
       </KeyboardAvoidingView>
 
-      {/* BİLDİRİMLER MODALI */}
+      {/* BİLDİRİMLER VE ÖNERİLER MODALI */}
       <Modal
         visible={showNotifications}
         animationType="slide"
@@ -457,15 +614,26 @@ const Chat = ({ navigation, sessionId, messages, setMessages, fetchSessions, onS
             {/* Modal Üst Başlık */}
             <View style={styles.modalHeader}>
               <View style={{ flexDirection: 'row', alignItems: 'center' }}>
-                <Bell color="#E50914" size={20} style={{ marginRight: 8 }} />
-                <Text style={styles.modalTitle}>Bildirimler</Text>
-                {notifications.length > 0 && (
+                <View style={styles.headerIconContainer}>
+                  <Bell color="#E50914" size={20} />
+                </View>
+                <View style={{ marginLeft: 10 }}>
+                  <Text style={styles.modalTitle}>Öneriler ve Bildirimler</Text>
+                  <Text style={styles.modalSubtitle}>Sana özel hazırlanan film tavsiyeleri</Text>
+                </View>
+                {unreadCount > 0 && (
                   <View style={styles.modalBadge}>
-                    <Text style={styles.modalBadgeText}>{notifications.length}</Text>
+                    <Text style={styles.modalBadgeText}>{unreadCount} yeni</Text>
                   </View>
                 )}
               </View>
               <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+                {unreadCount > 0 && (
+                  <TouchableOpacity onPress={handleMarkAllAsRead} style={styles.markReadBtn} activeOpacity={0.7}>
+                    <CheckCheck color="#E50914" size={16} />
+                    <Text style={styles.markReadBtnText}>Okundu Say</Text>
+                  </TouchableOpacity>
+                )}
                 {notifications.length > 0 && (
                   <TouchableOpacity onPress={handleClearNotifications} style={styles.clearBtn} activeOpacity={0.7}>
                     <Trash2 color="#aaa" size={16} />
@@ -479,53 +647,115 @@ const Chat = ({ navigation, sessionId, messages, setMessages, fetchSessions, onS
             </View>
 
             {/* Bildirim Listesi */}
-            {notifications.length === 0 ? (
+            {notificationsLoading && notifications.length === 0 ? (
+              <View style={styles.loadingContainer}>
+                <ActivityIndicator size="small" color="#E50914" />
+                <Text style={styles.loadingNotifText}>Öneriler yükleniyor...</Text>
+              </View>
+            ) : notifications.length === 0 ? (
               <View style={styles.emptyNotificationContainer}>
                 <View style={styles.emptyIconCircle}>
-                  <BellOff color="#666" size={38} />
+                  <Sparkles color="#E50914" size={38} />
                 </View>
                 <Text style={styles.emptyNotifTitle}>Henüz bildiriminiz yok</Text>
                 <Text style={styles.emptyNotifDesc}>
-                  Size özel öneriler ve güncellemeler geldiğinde burada saklanacaktır.
+                  Sohbet ettikçe zevkine uygun filmler yapay zeka tarafından analiz edilip burada listelenecektir 🍿
                 </Text>
               </View>
             ) : (
               <FlatList
                 data={notifications}
-                keyExtractor={(item) => item.id}
+                keyExtractor={(item) => String(item.id)}
                 showsVerticalScrollIndicator={false}
                 contentContainerStyle={styles.notifListContent}
-                renderItem={({ item }) => (
-                  <TouchableOpacity
-                    style={styles.notifCard}
-                    activeOpacity={0.8}
-                    onPress={() => handleNotificationPress(item)}
-                  >
-                    <View style={styles.notifIconBox}>
-                      <Film color="#E50914" size={18} />
-                    </View>
-                    <View style={styles.notifTextBox}>
-                      <View style={styles.notifHeaderRow}>
-                        <Text style={styles.notifItemTitle} numberOfLines={1}>{item.title}</Text>
-                        <Text style={styles.notifTime}>{item.timestamp || item.date}</Text>
-                      </View>
-                      <Text style={styles.notifBody}>{item.body}</Text>
-                      {(item.data?.movie_title || item.data?.movies || item.data?.movie) && (
-                        <View style={{ flexDirection: 'row', alignItems: 'center', marginTop: 6 }}>
-                          <Text style={{ color: '#E50914', fontSize: 12, fontWeight: '600', marginRight: 2 }}>Filmi İncele</Text>
-                          <ChevronRight color="#E50914" size={14} />
+                refreshControl={
+                  <RefreshControl
+                    refreshing={refreshingNotifications}
+                    onRefresh={() => {
+                      setRefreshingNotifications(true);
+                      fetchNotifications();
+                    }}
+                    tintColor="#E50914"
+                    colors={['#E50914']}
+                  />
+                }
+                renderItem={({ item }) => {
+                  const isUnread = !item.is_read;
+                  const poster = item.movie?.Poster || item.data?.movies?.[0]?.Poster || item.movie?.poster_url || item.data?.movies?.[0]?.poster_url;
+
+                  return (
+                    <View style={[styles.notifCard, isUnread && styles.notifCardUnread]}>
+                      {/* Sol tarafta poster veya film ikonu */}
+                      {poster ? (
+                        <Image
+                          source={{ uri: poster }}
+                          style={styles.notifPoster}
+                          contentFit="cover"
+                          transition={200}
+                        />
+                      ) : (
+                        <View style={[styles.notifIconBox, isUnread && styles.notifIconBoxUnread]}>
+                          <Film color={isUnread ? "#E50914" : "#888"} size={20} />
                         </View>
                       )}
+
+                      {/* İçerik Kutusu */}
+                      <View style={styles.notifTextBox}>
+                        <View style={styles.notifHeaderRow}>
+                          <View style={{ flexDirection: 'row', alignItems: 'center', flex: 1, marginRight: 6 }}>
+                            {isUnread && <View style={styles.unreadDot} />}
+                            <Text style={[styles.notifItemTitle, isUnread && styles.notifItemTitleUnread]} numberOfLines={1}>
+                              {item.title}
+                            </Text>
+                            {isUnread && (
+                              <View style={styles.newPillBadge}>
+                                <Text style={styles.newPillBadgeText}>YENİ</Text>
+                              </View>
+                            )}
+                          </View>
+                          <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+                            <Clock size={11} color="#666" style={{ marginRight: 3 }} />
+                            <Text style={styles.notifTime}>{formatNotificationDate(item.date || item.timestamp)}</Text>
+                          </View>
+                        </View>
+
+                        <Text style={[styles.notifBody, isUnread && styles.notifBodyUnread]}>
+                          {item.body}
+                        </Text>
+
+                        {/* Hızlı Aksiyon Butonları */}
+                        <View style={styles.notifActionsRow}>
+                          <TouchableOpacity
+                            style={styles.actionBtnPrimary}
+                            activeOpacity={0.7}
+                            onPress={() => handleNotificationPress(item)}
+                          >
+                            <Text style={styles.actionBtnPrimaryText}>Filmi İncele</Text>
+                            <ChevronRight color="#E50914" size={14} />
+                          </TouchableOpacity>
+
+                          <TouchableOpacity
+                            style={styles.actionBtnSecondary}
+                            activeOpacity={0.7}
+                            onPress={() => handleAskAboutMovie(item)}
+                          >
+                            <MessageSquare color="#aaa" size={13} style={{ marginRight: 4 }} />
+                            <Text style={styles.actionBtnSecondaryText}>Sohbette Sor</Text>
+                          </TouchableOpacity>
+                        </View>
+                      </View>
+
+                      {/* Sil Butonu */}
+                      <TouchableOpacity
+                        onPress={() => handleDeleteNotification(item.id)}
+                        style={styles.notifDeleteBtn}
+                        hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+                      >
+                        <X color="#666" size={16} />
+                      </TouchableOpacity>
                     </View>
-                    <TouchableOpacity
-                      onPress={() => handleDeleteNotification(item.id)}
-                      style={styles.notifDeleteBtn}
-                      hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
-                    >
-                      <X color="#666" size={16} />
-                    </TouchableOpacity>
-                  </TouchableOpacity>
-                )}
+                  );
+                }}
               />
             )}
           </View>
@@ -561,28 +791,47 @@ const styles = StyleSheet.create({
   suggestionsScrollContent: { paddingHorizontal: 15 },
   suggestionButton: { backgroundColor: '#1E1E1E', paddingHorizontal: 14, paddingVertical: 8, borderRadius: 18, borderWidth: 1, borderColor: '#E5091444', marginRight: 8 },
   suggestionText: { color: '#E0E0E0', fontSize: 13, fontWeight: '500' },
-  modalOverlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.7)', justifyContent: 'flex-end' },
-  modalContent: { backgroundColor: '#181818', borderTopLeftRadius: 24, borderTopRightRadius: 24, maxHeight: '80%', minHeight: 340, paddingHorizontal: 20, paddingTop: 18 },
+  modalOverlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.75)', justifyContent: 'flex-end' },
+  modalContent: { backgroundColor: '#161616', borderTopLeftRadius: 24, borderTopRightRadius: 24, maxHeight: '82%', minHeight: 360, paddingHorizontal: 20, paddingTop: 18 },
   modalHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingBottom: 14, borderBottomWidth: 1, borderBottomColor: '#282828' },
-  modalTitle: { color: '#fff', fontSize: 18, fontWeight: '700' },
+  headerIconContainer: { width: 34, height: 34, borderRadius: 17, backgroundColor: '#251214', justifyContent: 'center', alignItems: 'center' },
+  modalTitle: { color: '#fff', fontSize: 17, fontWeight: '700' },
+  modalSubtitle: { color: '#777', fontSize: 11, marginTop: 1 },
   modalBadge: { backgroundColor: '#E50914', borderRadius: 10, paddingHorizontal: 7, paddingVertical: 2, marginLeft: 8 },
   modalBadgeText: { color: '#fff', fontSize: 11, fontWeight: 'bold' },
-  clearBtn: { flexDirection: 'row', alignItems: 'center', backgroundColor: '#252525', paddingHorizontal: 10, paddingVertical: 6, borderRadius: 14, marginRight: 10 },
+  markReadBtn: { flexDirection: 'row', alignItems: 'center', backgroundColor: '#261315', paddingHorizontal: 10, paddingVertical: 6, borderRadius: 14, marginRight: 8, borderWidth: 1, borderColor: '#E5091444' },
+  markReadBtnText: { color: '#E50914', fontSize: 12, marginLeft: 4, fontWeight: '600' },
+  clearBtn: { flexDirection: 'row', alignItems: 'center', backgroundColor: '#252525', paddingHorizontal: 10, paddingVertical: 6, borderRadius: 14, marginRight: 8 },
   clearBtnText: { color: '#bbb', fontSize: 12, marginLeft: 4, fontWeight: '500' },
   closeBtn: { padding: 4 },
+  loadingContainer: { alignItems: 'center', justifyContent: 'center', paddingVertical: 45 },
+  loadingNotifText: { color: '#888', fontSize: 13, marginTop: 10 },
   emptyNotificationContainer: { alignItems: 'center', justifyContent: 'center', paddingVertical: 50, paddingHorizontal: 20 },
-  emptyIconCircle: { width: 72, height: 72, borderRadius: 36, backgroundColor: '#222', alignItems: 'center', justifyContent: 'center', marginBottom: 16 },
+  emptyIconCircle: { width: 72, height: 72, borderRadius: 36, backgroundColor: '#201618', alignItems: 'center', justifyContent: 'center', marginBottom: 16, borderWidth: 1, borderColor: '#3a181b' },
   emptyNotifTitle: { color: '#fff', fontSize: 16, fontWeight: '600', marginBottom: 6 },
-  emptyNotifDesc: { color: '#777', fontSize: 13, textAlign: 'center', lineHeight: 18 },
+  emptyNotifDesc: { color: '#777', fontSize: 13, textAlign: 'center', lineHeight: 19 },
   notifListContent: { paddingVertical: 14 },
-  notifCard: { flexDirection: 'row', backgroundColor: '#222', borderRadius: 14, padding: 12, marginBottom: 10, alignItems: 'center', borderWidth: 1, borderColor: '#2c2c2c' },
-  notifIconBox: { width: 36, height: 36, borderRadius: 18, backgroundColor: '#2a1517', justifyContent: 'center', alignItems: 'center', marginRight: 12 },
+  notifCard: { flexDirection: 'row', backgroundColor: '#1E1E1E', borderRadius: 14, padding: 12, marginBottom: 12, alignItems: 'flex-start', borderWidth: 1, borderColor: '#2A2A2A' },
+  notifCardUnread: { backgroundColor: '#221517', borderColor: '#E5091455', borderLeftWidth: 3.5, borderLeftColor: '#E50914' },
+  notifPoster: { width: 48, height: 72, borderRadius: 8, marginRight: 12, backgroundColor: '#262626' },
+  notifIconBox: { width: 44, height: 44, borderRadius: 22, backgroundColor: '#262626', justifyContent: 'center', alignItems: 'center', marginRight: 12 },
+  notifIconBoxUnread: { backgroundColor: '#331215' },
   notifTextBox: { flex: 1, marginRight: 8 },
-  notifHeaderRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 3 },
-  notifItemTitle: { color: '#fff', fontSize: 14, fontWeight: '600', flex: 1, marginRight: 6 },
+  notifHeaderRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 },
+  unreadDot: { width: 7, height: 7, borderRadius: 3.5, backgroundColor: '#E50914', marginRight: 6 },
+  notifItemTitle: { color: '#ddd', fontSize: 14, fontWeight: '600' },
+  notifItemTitleUnread: { color: '#fff', fontWeight: 'bold' },
+  newPillBadge: { backgroundColor: '#E50914', borderRadius: 4, paddingHorizontal: 5, paddingVertical: 1, marginLeft: 6 },
+  newPillBadgeText: { color: '#fff', fontSize: 9, fontWeight: '800' },
   notifTime: { color: '#777', fontSize: 11 },
-  notifBody: { color: '#bbb', fontSize: 13, lineHeight: 17 },
-  notifDeleteBtn: { padding: 6 }
+  notifBody: { color: '#999', fontSize: 13, lineHeight: 18, marginBottom: 8 },
+  notifBodyUnread: { color: '#ccc' },
+  notifActionsRow: { flexDirection: 'row', alignItems: 'center', marginTop: 2, flexWrap: 'wrap', gap: 8 },
+  actionBtnPrimary: { flexDirection: 'row', alignItems: 'center', backgroundColor: '#2E1416', paddingHorizontal: 10, paddingVertical: 5, borderRadius: 8, borderWidth: 1, borderColor: '#E5091444' },
+  actionBtnPrimaryText: { color: '#E50914', fontSize: 12, fontWeight: '600', marginRight: 2 },
+  actionBtnSecondary: { flexDirection: 'row', alignItems: 'center', backgroundColor: '#272727', paddingHorizontal: 9, paddingVertical: 5, borderRadius: 8 },
+  actionBtnSecondaryText: { color: '#bbb', fontSize: 12, fontWeight: '500' },
+  notifDeleteBtn: { padding: 4, marginTop: 2 }
 });
 
 export default Chat;
